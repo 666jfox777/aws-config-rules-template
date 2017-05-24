@@ -31,6 +31,7 @@
 
 
 import sys
+import time
 import argparse
 import csv
 import os.path
@@ -65,20 +66,22 @@ def execute(template, s3bucket, s3key, output, e=False):
 
         # Let's get a client running for S3 and for CloudFormation
         s3 = boto3.client('s3')
+        s3_resource = boto3.resource('s3')
         cloudformation = boto3.client('cloudformation')
 
         # Package the AWS Lambda Function as a Zip File
         try:
-            zip = zipfile.ZipFile('cf-cis-benchmarks-lambda-source.zip', 'w', zipfile.ZIP_DEFLATED)
-            zip.write('./index.js')
+            zip = zipfile.ZipFile('cf-cis-benchmarks-lambda-source.zip', 'w', compression=zipfile.ZIP_DEFLATED)
+            zip.write('index.js')
             zip.close()
         except:
             print "An error occurred while attempting to generate a Zip File of the AWS Lambda code."
+            raise
             exit(1)
 
         # Upload the Zip File to AWS S3
         try:
-            lambda_response = s3.put_object( Body='cf-cis-benchmarks-lambda-source.zip', Bucket=s3bucket, Key='%s/cf-cis-benchmarks-lambda-source.zip' % (s3key) )
+            s3_resource.meta.client.upload_file('./cf-cis-benchmarks-lambda-source.zip', s3bucket, '%s/cf-cis-benchmarks-lambda-source.zip' % (s3key))
         except:
             print "An error occurred while trying to upload the Lambda Zip File to AWS S3."
             exit(1)
@@ -100,6 +103,7 @@ def execute(template, s3bucket, s3key, output, e=False):
             if status == "ROLLBACK_COMPLETE":
                 delete_response = cloudformation.delete_stack( StackName='cf-cis-benchmarks' )
                 print "Deleting broken stack..."
+                time.sleep( 30 )
                 create_response = cloudformation.create_stack(
                     StackName='cf-cis-benchmarks',
                     TemplateURL='https://s3.amazonaws.com/%s/%s/%s' % (s3bucket, s3key, output),
@@ -144,6 +148,8 @@ def execute(template, s3bucket, s3key, output, e=False):
 #
 # If the tool cannot write the template to disk, it will print an error and exit the application.
 def write_template(template, destination):
+    """
+    """
     try:
         with open(destination, 'w') as file:
             file.write(template)
@@ -237,10 +243,10 @@ def add_lambda_function(resources, outputs, s3bucket, s3key):
     resources.append(
         Function(
             "LambdaConfigRulesFunction",
-            Code=Code( S3Bucket=s3bucket, S3Key=s3key ),
-            Handler="LambdaConfigRulesFunction.handler",
+            Code=Code( S3Bucket=s3bucket, S3Key='%s/cf-cis-benchmarks-lambda-source.zip' % (s3key) ),
+            Handler="index.handler",
             Role=GetAtt("LambdaConfigRulesRole", "Arn"),
-            Runtime="nodejs4.3",
+            Runtime="nodejs6.10",
             Timeout=10
         )
     )
@@ -358,7 +364,7 @@ def add_sns_topic(resources, outputs):
     return resources, outputs
 
 
-def generate_template(accountalarms, configrules, lambdacode, s3bucket, s3key):
+def generate_template(accountalarms, configrules, s3bucket, s3key):
     parameters = []
     maps = []
     resources = []
@@ -386,7 +392,6 @@ def generate_template(accountalarms, configrules, lambdacode, s3bucket, s3key):
         "This template creates many Amazon CloudWatch alarms based on a Amazon"
         " CloudWatch Logs Log Group. You will be billed for the AWS resources "
         "used if you create a stack from this template."
-        " ./cf-accountlevelalarms-stack.py -p jfox -d writr.ca -s cis"
     )
     [template.add_parameter(p) for p in parameters]
     [template.add_condition(k, conditions[k]) for k in conditions]
@@ -454,13 +459,10 @@ def main(argv):
     # Add optional arguments for template generation
     parser.add_argument( "-f", "--file",      help="The path to the CSV formatted file that contains the configuration of CloudWatch Metrics and Alarms.", required=False )
     parser.add_argument( "-i", "--input",     help="The path to the CSV formatted file that contains the configuration of the Lambda functions and Config Rules.", required=False )
-    parser.add_argument( "-l", "--awslambda", help="The path to the Lambda Function code base.", required=False )
     parser.add_argument( "-o", "--output",    help="The local output destination for the CloudFormation template and Lambda zip files. Defaults to the current working directory.", required=False )
 
     # Add optional arguments for execution against AWS
     parser.add_argument( "-e", "--execute",   help="A boolean flag that controls whether to execute the stack against an AWS account.", default=False, required=False )
-    parser.add_argument( "-p", "--profile",   help="The AWS profile to use for the AWS SDK.", required=False )
-    parser.add_argument( "-r", "--region",    help="The AWS region to use for the AWS SDK. Note: while much of what will be executed is region agnostic, this will set where the S3 buckets, CloudFormation stacks, and Config Rules are found.", required=False )
     parser.add_argument( "-b", "--s3bucket",  help="The AWS S3 Bucket used to store the CloudFormation template and related AWS stack resources.", required=False )
     parser.add_argument( "-k", "--s3key",     help="The AWS S3 file path for where to store the files in the S3 bucket. If not supplied the root of the bucket will be used.", required=False )
 
@@ -470,13 +472,10 @@ def main(argv):
     # Parse the arguments that have been provided.
     args = parser.parse_args()
 
-
     # Verify / set required variables.
-    region = args.region or "us-east-1"
     accountalarms = args.file or "accountalarms.csv"
     configrules = args.input or "configrules.csv"
     output = args.output or "cis-benchmarks.template"
-    lambdacode = args.awslambda or "lambda/configrules/index.js"
     s3bucket = args.s3bucket or "justinfox"
     s3key = args.s3key or "example"
 
@@ -487,7 +486,7 @@ def main(argv):
     configrules = process_configrules(configrules)
 
     # Iterate through the configuration and generate the template
-    template = generate_template( accountalarms, configrules, lambdacode, s3bucket, s3key )
+    template = generate_template( accountalarms, configrules, s3bucket, s3key )
 
     # Write the template to disk or against an AWS environment.
     execute(template, s3bucket, s3key, output, args.execute )
